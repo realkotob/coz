@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.13.0)
-project(coz VERSION 0.2.2 LANGUAGES C CXX)
+project(coz VERSION 0.2.5 LANGUAGES C CXX)
 
 enable_testing()
 
@@ -11,37 +11,108 @@ list(APPEND CMAKE_MODULE_PATH ${PROJECT_BINARY_DIR} ${PROJECT_SOURCE_DIR}/cmake)
 
 find_package(Threads REQUIRED)
 
+# ============== LIEF library for cross-platform binary parsing ==============
+option(USE_SYSTEM_LIEF "Link against LIEF discovered via find_package" OFF)
+
+if(USE_SYSTEM_LIEF)
+    find_package(LIEF REQUIRED)
+else()
+    include(FetchContent)
+
+    set(LIEF_GIT_TAG "0.17.0" CACHE STRING
+        "Git tag/branch/commit for LIEF")
+    set(LIEF_GIT_REPO "https://github.com/lief-project/LIEF.git" CACHE STRING
+        "Git repository URL for LIEF")
+
+    # Disable LIEF features we don't need to speed up build
+    set(LIEF_PYTHON_API OFF CACHE BOOL "" FORCE)
+    set(LIEF_C_API OFF CACHE BOOL "" FORCE)
+    set(LIEF_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(LIEF_TESTS OFF CACHE BOOL "" FORCE)
+    set(LIEF_DOC OFF CACHE BOOL "" FORCE)
+    set(LIEF_LOGGING OFF CACHE BOOL "" FORCE)
+    set(LIEF_ENABLE_JSON OFF CACHE BOOL "" FORCE)
+    # Only enable formats we need
+    set(LIEF_ELF ON CACHE BOOL "" FORCE)
+    set(LIEF_PE OFF CACHE BOOL "" FORCE)
+    set(LIEF_MACHO ON CACHE BOOL "" FORCE)
+    set(LIEF_OAT OFF CACHE BOOL "" FORCE)
+    set(LIEF_DEX OFF CACHE BOOL "" FORCE)
+    set(LIEF_VDEX OFF CACHE BOOL "" FORCE)
+    set(LIEF_ART OFF CACHE BOOL "" FORCE)
+    set(LIEF_COFF OFF CACHE BOOL "" FORCE)
+
+    FetchContent_Declare(
+        LIEF
+        GIT_REPOSITORY ${LIEF_GIT_REPO}
+        GIT_TAG        ${LIEF_GIT_TAG}
+    )
+
+    FetchContent_MakeAvailable(LIEF)
+    message(STATUS "Fetched LIEF ${LIEF_GIT_TAG}")
+endif()
+
+# ============== libelfin for DWARF parsing ==============
 option(USE_SYSTEM_LIBELFIN "Link against libelfin discovered via pkg-config" OFF)
 
 if(USE_SYSTEM_LIBELFIN)
     find_package(libelfin REQUIRED)
 else()
+    # Check for local libelfin directory first (may contain patches/modifications)
+    if(EXISTS "${PROJECT_SOURCE_DIR}/libelfin/elf/elf.cc")
+        set(libelfin_SOURCE_DIR "${PROJECT_SOURCE_DIR}/libelfin")
+        message(STATUS "Using local libelfin from ${libelfin_SOURCE_DIR}")
+        set(LIBELFIN_LOCAL TRUE)
+    else()
+        # Fetch libelfin from GitHub
+        include(FetchContent)
+
+        set(LIBELFIN_GIT_TAG "origin/improved_dwarf5_support" CACHE STRING
+            "Git tag/branch/commit for libelfin (default: DWARF5 support with pre-built to_string.cc)")
+        set(LIBELFIN_GIT_REPO "https://github.com/plasma-umass/libelfin.git" CACHE STRING
+            "Git repository URL for libelfin")
+
+        FetchContent_Declare(
+            libelfin
+            GIT_REPOSITORY ${LIBELFIN_GIT_REPO}
+            GIT_TAG        ${LIBELFIN_GIT_TAG}
+        )
+
+        FetchContent_GetProperties(libelfin)
+        if(NOT libelfin_POPULATED)
+            FetchContent_Populate(libelfin)
+        endif()
+        message(STATUS "Fetched libelfin to ${libelfin_SOURCE_DIR}")
+        set(LIBELFIN_LOCAL FALSE)
+    endif()
+
     set(LIBELFIN_ELF_SOURCES
-        ${PROJECT_SOURCE_DIR}/libelfin/elf/elf.cc
-        ${PROJECT_SOURCE_DIR}/libelfin/elf/mmap_loader.cc
-        ${PROJECT_SOURCE_DIR}/libelfin/elf/to_string.cc)
+        ${libelfin_SOURCE_DIR}/elf/elf.cc
+        ${libelfin_SOURCE_DIR}/elf/mmap_loader.cc
+        ${libelfin_SOURCE_DIR}/elf/to_string.cc)
 
     set(LIBELFIN_DWARF_SOURCES
-        ${PROJECT_SOURCE_DIR}/libelfin/dwarf/abbrev.cc
-        ${PROJECT_SOURCE_DIR}/libelfin/dwarf/attrs.cc
-        ${PROJECT_SOURCE_DIR}/libelfin/dwarf/cursor.cc
-        ${PROJECT_SOURCE_DIR}/libelfin/dwarf/die.cc
-        ${PROJECT_SOURCE_DIR}/libelfin/dwarf/die_str_map.cc
-        ${PROJECT_SOURCE_DIR}/libelfin/dwarf/dwarf.cc
-        ${PROJECT_SOURCE_DIR}/libelfin/dwarf/elf.cc
-        ${PROJECT_SOURCE_DIR}/libelfin/dwarf/expr.cc
-        ${PROJECT_SOURCE_DIR}/libelfin/dwarf/line.cc
-        ${PROJECT_SOURCE_DIR}/libelfin/dwarf/rangelist.cc
-        ${PROJECT_SOURCE_DIR}/libelfin/dwarf/to_string.cc
-        ${PROJECT_SOURCE_DIR}/libelfin/dwarf/value.cc)
+        ${libelfin_SOURCE_DIR}/dwarf/abbrev.cc
+        ${libelfin_SOURCE_DIR}/dwarf/attrs.cc
+        ${libelfin_SOURCE_DIR}/dwarf/cursor.cc
+        ${libelfin_SOURCE_DIR}/dwarf/die.cc
+        ${libelfin_SOURCE_DIR}/dwarf/die_str_map.cc
+        ${libelfin_SOURCE_DIR}/dwarf/dwarf.cc
+        ${libelfin_SOURCE_DIR}/dwarf/elf.cc
+        ${libelfin_SOURCE_DIR}/dwarf/expr.cc
+        ${libelfin_SOURCE_DIR}/dwarf/line.cc
+        ${libelfin_SOURCE_DIR}/dwarf/rangelist.cc
+        ${libelfin_SOURCE_DIR}/dwarf/to_string.cc
+        ${libelfin_SOURCE_DIR}/dwarf/value.cc)
 
     add_library(libelfin_internal STATIC
         ${LIBELFIN_ELF_SOURCES}
         ${LIBELFIN_DWARF_SOURCES})
+
     target_include_directories(libelfin_internal PUBLIC
-        ${PROJECT_SOURCE_DIR}/libelfin
-        ${PROJECT_SOURCE_DIR}/libelfin/elf
-        ${PROJECT_SOURCE_DIR}/libelfin/dwarf)
+        ${libelfin_SOURCE_DIR}
+        ${libelfin_SOURCE_DIR}/elf
+        ${libelfin_SOURCE_DIR}/dwarf)
     target_compile_features(libelfin_internal PUBLIC cxx_std_11)
     set_target_properties(libelfin_internal PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
@@ -57,8 +128,9 @@ option(INSTALL_COZ "Enable installation of coz. (Projects embedding coz may want
 if(INSTALL_COZ)
     include(GNUInstallDirs)
     include(CMakePackageConfigHelpers)
-    install(PROGRAMS coz DESTINATION bin)
-    install(FILES LICENSE.md DESTINATION licenses)
+    install(PROGRAMS coz DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES LICENSE.md DESTINATION ${CMAKE_INSTALL_DOCDIR})
+    install(FILES pyproject.toml DESTINATION ${CMAKE_INSTALL_DATADIR}/coz)
 
     # Install the viewer web application
     install(DIRECTORY viewer/
@@ -91,6 +163,14 @@ if(INSTALL_COZ)
 endif()
 
 add_subdirectory(libcoz)
+
+# The JVMTI agent is independent of libcoz: JIT-compiled Java frames carry no
+# DWARF, so it does its own sampling and virtual speedup. Off by default because
+# it needs a JDK.
+option(BUILD_JAVA_AGENT "Build the coz JVMTI agent for profiling Java" OFF)
+if(BUILD_JAVA_AGENT)
+    add_subdirectory(java)
+endif()
 
 option(BUILD_BENCHMARKS "Build benchmarks" OFF)
 if(BUILD_BENCHMARKS)

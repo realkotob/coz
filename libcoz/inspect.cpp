@@ -5,17 +5,21 @@
  * directory of this distribution and at http://github.com/plasma-umass/coz.
  */
 
+#ifndef __APPLE__
+#include <link.h>
+#include <limits.h>
+#include <unistd.h>
+#endif
+
 #include "inspect.h"
 
+#include "lief_loader.h"
+
 #ifdef __APPLE__
-  #include "elf_compat.h"
-#else
-  #include <elf.h>
+  #include <mach-o/dyld.h>
 #endif
-#include <fcntl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -23,7 +27,6 @@
 #include <fstream>
 #include <map>
 #include <set>
-#include <sstream>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -31,50 +34,16 @@
 #include <vector>
 
 #include <algorithm>
-#include <libelfin/dwarf/dwarf++.hh>
-#include <libelfin/elf/elf++.hh>
+#include <dwarf++.hh>
 
 #include "util.h"
 
 #include "ccutil/log.h"
+#include "path_filter.h"
 
 using namespace std;
 
 static dwarf::value find_attribute(const dwarf::die& d, dwarf::DW_AT attr);
-
-/**
- * Locate the build ID encoded in an ELF file and return it as a formatted string
- */
-static string find_build_id(elf::elf& f) {
-  for(auto& section : f.sections()) {
-    if(section.get_hdr().type == elf::sht::note) {
-      uintptr_t base = reinterpret_cast<uintptr_t>(section.data());
-      size_t offset = 0;
-      while(offset < section.size()) {
-        Elf64_Nhdr* hdr = reinterpret_cast<Elf64_Nhdr*>(base + offset);
-
-        if(hdr->n_type == NT_GNU_BUILD_ID) {
-          // Found the build-id note
-          stringstream ss;
-          uintptr_t desc_base = base + offset + sizeof(Elf64_Nhdr) + hdr->n_namesz;
-          uint8_t* build_id = reinterpret_cast<uint8_t*>(desc_base);
-          for(size_t i = 0; i < hdr->n_descsz; i++) {
-            ss.flags(ios::hex);
-            ss.width(2);
-            ss.fill('0');
-            ss << static_cast<size_t>(build_id[i]);
-          }
-          return ss.str();
-
-        } else {
-          // Advance to the next note header
-          offset += sizeof(Elf64_Nhdr) + hdr->n_namesz + hdr->n_descsz;
-        }
-      }
-    }
-  }
-  return "";
-}
 
 static string absolute_path(const string filename) {
   if(filename[0] == '/') return filename;
@@ -140,145 +109,76 @@ static const string get_full_path(const string filename) {
   return "";
 }
 
-/**
- * Locate an ELF file that contains debug symbols for the file provided by name.
- * This will work for files specified by relative path, absolute path, or raw name
- * resolved via the PATH variable.
- */
-static elf::elf locate_debug_executable(const string filename) {
-  elf::elf f;
-
-  const string full_path = get_full_path(filename);
-
-  // If a full path wasn't found, return the invalid ELF file
-  if(full_path.length() == 0) {
-    WARNING << "Full path is empty, returning invalid elf";
-    return f;
-  }
-
-  int fd = open(full_path.c_str(), O_RDONLY);
-
-  // If the file couldn't be opened, return the invalid ELF file
-  if(fd < 0) {
-    return f;
-  }
-
-  // Load the opened ELF file
-  f = elf::elf(elf::create_mmap_loader(fd));
-
-  // If this file has a .debug_info section, return it
-  if(f.get_section(".debug_info").valid()) {
-    return f;
-  }
-
 #ifdef __APPLE__
-  // On macOS, check for .dSYM bundle
-  string binary_name = full_path.substr(full_path.find_last_of('/') + 1);
-  string dsym_path = full_path + ".dSYM/Contents/Resources/DWARF/" + binary_name;
-
-  int dsym_fd = open(dsym_path.c_str(), O_RDONLY);
-  if(dsym_fd >= 0) {
-    try {
-      elf::elf dsym_f = elf::elf(elf::create_mmap_loader(dsym_fd));
-      auto debug_info = dsym_f.get_section(".debug_info");
-      if(debug_info.valid()) {
-        return dsym_f;
-      }
-    } catch (const std::exception& e) {
-      (void)e;
-    }
-  }
-#endif
-
-  // If there isn't a .debug_info section, check for the .gnu_debuglink section
-  auto& link_section = f.get_section(".gnu_debuglink");
-
-  // Store the full path to the executable and its directory name
-  string directory = full_path.substr(0, full_path.find_last_of('/'));
-
-  // Build a set of paths to search for a debug version of the file
-  vector<string> search_paths;
-
-  // Check for a build-id section
-  string build_id = find_build_id(f);
-  if(build_id.length() > 0) {
-    string prefix = build_id.substr(0, 2);
-    string suffix = build_id.substr(2);
-
-    auto p = string("/usr/lib/debug/.build-id/") + prefix + "/" + suffix + ".debug";
-    search_paths.push_back(p);
-  }
-
-  // Check for a debug_link section
-  if(link_section.valid()) {
-    string link_name = reinterpret_cast<const char*>(link_section.data());
-
-    search_paths.push_back(directory + "/" + link_name);
-    search_paths.push_back(directory + "/.debug/" + link_name);
-    search_paths.push_back("/usr/lib/debug" + directory + "/" + link_name);
-  }
-
-  // Clear the loaded file so if we have to return it, it won't be valid()
-  f = elf::elf();
-
-  // Try all the usable search paths
-  for(const string& path : search_paths) {
-    fd = open(path.c_str(), O_RDONLY);
-    if(fd >= 0) {
-      f = elf::elf(elf::create_mmap_loader(fd));
-      if(f.get_section(".debug_info").valid()) {
-        break;
-      }
-      f = elf::elf();
-    }
-  }
-
-  return f;
-}
-
 unordered_map<string, uintptr_t> get_loaded_files() {
   unordered_map<string, uintptr_t> result;
 
-  ifstream maps("/proc/self/maps");
-  while(maps.good() && !maps.eof()) {
-    uintptr_t base, limit;
-    char perms[5];
-    size_t offset;
-    size_t dev_major, dev_minor;
-    uintptr_t inode;
-    string path;
-
-    // Skip over whitespace
-    maps >> skipws;
-
-    // Read in "<base>-<limit> <perms> <offset> <dev_major>:<dev_minor> <inode>"
-    maps >> std::hex >> base;
-    if(maps.get() != '-') break;
-    maps >> std::hex >> limit;
-
-    if(maps.get() != ' ') break;
-    maps.get(perms, 5);
-
-    maps >> std::hex >> offset;
-    maps >> std::hex >> dev_major;
-    if(maps.get() != ':') break;
-    maps >> std::hex >> dev_minor;
-    maps >> std::dec >> inode;
-
-    // Skip over spaces and tabs
-    while(maps.peek() == ' ' || maps.peek() == '\t') { maps.ignore(1); }
-
-    // Read out the mapped file's path
-    getline(maps, path);
-
-    // If this is an executable mapping of an absolute path, include it
-    if(perms[2] == 'x' && path[0] == '/') {
-      result[path] = base - offset;
+  uint32_t count = _dyld_image_count();
+  for(uint32_t i = 0; i < count; i++) {
+    const char* name = _dyld_get_image_name(i);
+    if(name && name[0] == '/') {
+      intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+      result[name] = static_cast<uintptr_t>(slide);
     }
   }
 
   return result;
 }
+#else
+/// Resolve the main executable's path, since dl_iterate_phdr reports it as "".
+static string main_executable_path() {
+  char buffer[PATH_MAX];
+  ssize_t len = readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+  if(len <= 0) return string();
+  buffer[len] = '\0';
+  return string(buffer);
+}
+
+static int collect_loaded_file(struct dl_phdr_info* info, size_t, void* data) {
+  auto* result = static_cast<unordered_map<string, uintptr_t>*>(data);
+
+  string path = (info->dlpi_name != nullptr && info->dlpi_name[0] != '\0')
+                    ? string(info->dlpi_name)
+                    : main_executable_path();
+
+  // The vDSO and other synthetic objects have no file to read DWARF from.
+  if(path.empty() || path[0] != '/') return 0;
+
+  // Only objects with executable code can contain a sampled program counter.
+  bool has_executable_segment = false;
+  for(int i = 0; i < info->dlpi_phnum; i++) {
+    const ElfW(Phdr)& phdr = info->dlpi_phdr[i];
+    if(phdr.p_type == PT_LOAD && (phdr.p_flags & PF_X)) {
+      has_executable_segment = true;
+      break;
+    }
+  }
+  if(!has_executable_segment) return 0;
+
+  // dlpi_addr *is* the load bias: the value to add to a virtual address from
+  // the object's headers to get the address it actually lives at.
+  (*result)[path] = static_cast<uintptr_t>(info->dlpi_addr);
+  return 0;
+}
+
+/// Map each loaded object's path to its load bias.
+///
+/// This used to parse /proc/self/maps and take `base - offset` of the first
+/// executable mapping. That only equals the load bias when the executable
+/// PT_LOAD segment satisfies p_vaddr == p_offset. It usually does for a simple
+/// C program, so the bug hid for years -- but rustc's output has, for example,
+/// p_offset=0x14f80 against p_vaddr=0x15f80, and the bias came out 0x1000 too
+/// large. Every line range was then shifted by a page: most samples still landed
+/// inside *some* line, so coz reported plausible-looking profiles attributed to
+/// the wrong source lines, and on some layouts nothing matched at all.
+///
+/// dl_iterate_phdr reports the bias directly, which is what it is for.
+unordered_map<string, uintptr_t> get_loaded_files() {
+  unordered_map<string, uintptr_t> result;
+  dl_iterate_phdr(collect_loaded_file, &result);
+  return result;
+}
+#endif
 
 bool wildcard_match(string::const_iterator subject,
                     string::const_iterator subject_end,
@@ -338,31 +238,6 @@ bool in_scope(const string& name, const unordered_set<string>& scope) {
   return in_scope_normalized(normalized, scope);
 }
 
-static bool path_has_prefix(const string& path, const string& prefix) {
-  if(prefix.empty())
-    return false;
-  if(prefix.size() > path.size())
-    return false;
-  if(path.compare(0, prefix.size(), prefix) != 0)
-    return false;
-  return path.size() == prefix.size() || path[prefix.size()] == '/';
-}
-
-static bool is_system_path(const string& normalized) {
-  static const vector<string> prefixes = {
-    "/usr/include",
-    "/usr/lib",
-    "/usr/local/include",
-    "/usr/local/lib",
-    "/lib",
-    "/lib64"
-  };
-  for(const auto& prefix : prefixes) {
-    if(path_has_prefix(normalized, prefix))
-      return true;
-  }
-  return false;
-}
 
 static bool file_matches_scope(const string& name,
                                const unordered_set<string>& scope,
@@ -370,10 +245,16 @@ static bool file_matches_scope(const string& name,
   if(name.empty())
     return false;
   string normalized = canonicalize_path(name);
+  if(is_coz_header(normalized))
+    return false;
   if(!allow_system_sources && is_system_path(normalized))
     return false;
   if(scope.empty())
     return true;
+  // Filter Rust toolchain/dependency paths unless user specified an explicit source scope
+  bool default_scope = (scope.size() == 1 && scope.count("%") == 1);
+  if(default_scope && is_rust_path(normalized))
+    return false;
   return in_scope_normalized(normalized, scope);
 }
 
@@ -499,10 +380,10 @@ void memory_map::build(const unordered_set<string>& binary_scope,
     if(in_scope(f.first, binary_scope)) {
       try {
         if(process_file(f.first, f.second, source_scope, allow_system_sources)) {
-          INFO << "Including lines from executable " << f.first;
+          VERBOSE << "Including lines from executable " << f.first;
           in_scope_count++;
         } else {
-          INFO << "Unable to locate debug information for " << f.first;
+          VERBOSE << "Unable to locate debug information for " << f.first;
         }
       } catch(const system_error& e) {
         WARNING << "Processing file \"" << f.first << "\" failed: " << e.what();
@@ -662,28 +543,22 @@ void memory_map::process_inlines(const dwarf::die& d,
 bool memory_map::process_file(const string& name, uintptr_t load_address,
                               const unordered_set<string>& source_scope,
                               bool allow_system_sources) {
-  elf::elf f = locate_debug_executable(name);
-  // If a debug version of the file could not be located, return false
-  if(!f.valid()) {
+  // Use unified LIEF-based loader for both ELF and Mach-O
+  auto loader = lief_loader::load(name);
+  if(!loader) {
     return false;
   }
+  dwarf::dwarf d(loader);
 
-  switch(f.get_hdr().type) {
-    case elf::et::exec:
-      // Loaded at base zero
-      load_address = 0;
-      break;
-
-    case elf::et::dyn:
-      // Load address should stay as-is
-      break;
-
-    default:
-      WARNING << "Unsupported ELF file type...";
+#ifndef __APPLE__
+  // On Linux, adjust load_address for static executables (ET_EXEC)
+  // Static executables are loaded at fixed addresses (typically 0)
+  // PIE executables and shared libraries (ET_DYN) use the load address from /proc/self/maps
+  if(lief_loader::is_static_executable(name)) {
+    load_address = 0;
   }
-
-  // Read the DWARF information from the chosen file
-  dwarf::dwarf d(dwarf::elf::create_loader(f));
+#endif
+  // On macOS, load_address is already the ASLR slide from dyld
 
   vector<memory_map::queued_range> pending;
 
@@ -695,9 +570,23 @@ bool memory_map::process_file(const string& name, uintptr_t load_address,
       size_t prev_line;
       uintptr_t prev_address = 0;
       set<string> included_files;
-      const auto& table = unit.get_line_table();
-      if(!table.valid())
+      dwarf::line_table table;
+#ifdef __APPLE__
+      // On macOS, catch DWARF parsing errors and skip problematic CUs
+      try {
+        table = unit.get_line_table();
+      } catch (const dwarf::format_error& e) {
         continue;
+      } catch (const std::exception& e) {
+        continue;
+      }
+#else
+      // On Linux, let DWARF parsing exceptions propagate for proper error reporting
+      table = unit.get_line_table();
+#endif
+      if(!table.valid()) {
+        continue;
+      }
       vector<subprogram_range> subprograms;
       collect_subprogram_ranges(unit.root(),
                                 table,
@@ -735,7 +624,7 @@ bool memory_map::process_file(const string& name, uintptr_t load_address,
           }
         }
 
-        if(line_info.end_sequence) {
+        if(line_info.end_sequence || line_info.line == 0) {
           prev_address = 0;
         } else {
           prev_filename = canonicalize_path(line_info.file->path);
@@ -751,7 +640,7 @@ bool memory_map::process_file(const string& name, uintptr_t load_address,
                       pending);
 
       for(const string& filename : included_files) {
-        INFO << "Included source file " << filename;
+        VERBOSE << "Included source file " << filename;
       }
 
     } catch(dwarf::format_error e) {

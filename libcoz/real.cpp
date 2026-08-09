@@ -9,6 +9,7 @@
 #include "ccutil/log.h"
 
 #include <dlfcn.h>
+#include <semaphore.h>
 
 #include <dlfcn.h>
 #include <stdint.h>
@@ -26,7 +27,7 @@ static void* pthread_handle = NULL;   //< The `dlopen` handle to libpthread
 
 #define GET_SYMBOL_HANDLE(name, handle) \
   decltype(::name)* real_##name = nullptr; \
-  while(!__atomic_exchange_n(&resolving, true, __ATOMIC_ACQ_REL)) {} \
+  while(__atomic_exchange_n(&resolving, true, __ATOMIC_ACQ_REL)) {} \
   uintptr_t addr = reinterpret_cast<uintptr_t>(dlsym(handle, #name)); \
   memcpy(&real_##name, &addr, sizeof(uintptr_t)); \
   if(real_##name) { \
@@ -42,6 +43,20 @@ static void* pthread_handle = NULL;   //< The `dlopen` handle to libpthread
  * Get the `dlopen` handle for libpthread
  */
 static void* get_pthread_handle() {
+#ifdef __APPLE__
+  // On macOS, pthread is part of libSystem which is always loaded
+  // We need to use a direct handle to libSystem.B.dylib to avoid
+  // DYLD interposition when resolving symbols
+  static void* libsystem_handle = nullptr;
+  if(libsystem_handle == nullptr) {
+    libsystem_handle = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOW | RTLD_NOLOAD);
+    if(libsystem_handle == nullptr) {
+      // Fallback to loading it
+      libsystem_handle = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOW);
+    }
+  }
+  return libsystem_handle ? libsystem_handle : RTLD_DEFAULT;
+#else
   if(pthread_handle == NULL && !__atomic_exchange_n(&in_dlopen, true, __ATOMIC_ACQ_REL)) {
     pthread_handle = dlopen("libpthread.so.0", RTLD_NOW | RTLD_GLOBAL);
     REQUIRE(pthread_handle != NULL) << dlerror();
@@ -49,6 +64,7 @@ static void* get_pthread_handle() {
   }
 
   return pthread_handle;
+#endif
 }
 
 /*
@@ -129,7 +145,10 @@ static int resolve_sigtimedwait(const sigset_t* set, siginfo_t* info, const stru
 
 static int resolve_pthread_create(pthread_t* t, const pthread_attr_t* attr, void* (*fn)(void*), void* arg) throw() {
   GET_SYMBOL_HANDLE(pthread_create, get_pthread_handle());
-  if(real_pthread_create) return real_pthread_create(t, attr, fn, arg);
+  if(real_pthread_create) {
+    int result = real_pthread_create(t, attr, fn, arg);
+    return result;
+  }
   else return -1;
 }
 
@@ -275,6 +294,42 @@ static int resolve_pthread_rwlock_unlock(pthread_rwlock_t* rwlock) throw() {
   else return 0;  // Silently elide synchronization during linking
 }
 
+#ifndef __APPLE__
+// POSIX semaphores. glibc exports these from libc, so RTLD_NEXT finds the real
+// ones. Failing to resolve must not silently skip the wait -- unlike a lock,
+// eliding sem_wait would change the program's semantics -- so fall back to
+// returning an error the caller can see.
+static int resolve_sem_wait(sem_t* sem) throw() {
+  GET_SYMBOL(sem_wait);
+  if(real_sem_wait) return real_sem_wait(sem);
+  else return -1;
+}
+
+static int resolve_sem_trywait(sem_t* sem) throw() {
+  GET_SYMBOL(sem_trywait);
+  if(real_sem_trywait) return real_sem_trywait(sem);
+  else return -1;
+}
+
+static int resolve_sem_timedwait(sem_t* sem, const struct timespec* abstime) throw() {
+  GET_SYMBOL(sem_timedwait);
+  if(real_sem_timedwait) return real_sem_timedwait(sem, abstime);
+  else return -1;
+}
+
+static int resolve_sem_post(sem_t* sem) throw() {
+  GET_SYMBOL(sem_post);
+  if(real_sem_post) return real_sem_post(sem);
+  else return -1;
+}
+
+static int resolve_sigaltstack(const stack_t* ss, stack_t* old_ss) throw() {
+  GET_SYMBOL(sigaltstack);
+  if(real_sigaltstack) return real_sigaltstack(ss, old_ss);
+  else return -1;
+}
+#endif
+
 #define DEFINE_WRAPPER(name) decltype(::name)* name = &resolve_##name;
 
 /**
@@ -292,6 +347,9 @@ namespace real {
   DEFINE_WRAPPER(kill);
   DEFINE_WRAPPER(sigprocmask);
   DEFINE_WRAPPER(sigwait);
+#ifndef __APPLE__
+  DEFINE_WRAPPER(sigaltstack);
+#endif
 #ifndef __APPLE__
   DEFINE_WRAPPER(sigwaitinfo);
   DEFINE_WRAPPER(sigtimedwait);
@@ -334,4 +392,11 @@ namespace real {
   DEFINE_WRAPPER(pthread_rwlock_timedwrlock);
 #endif
   DEFINE_WRAPPER(pthread_rwlock_unlock);
+
+#ifndef __APPLE__
+  DEFINE_WRAPPER(sem_wait);
+  DEFINE_WRAPPER(sem_trywait);
+  DEFINE_WRAPPER(sem_timedwait);
+  DEFINE_WRAPPER(sem_post);
+#endif
 }

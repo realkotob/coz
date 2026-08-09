@@ -1154,6 +1154,7 @@ struct sqlite3_io_methods {
 */
 typedef struct sqlite3_mutex sqlite3_mutex;
 static void pthreadMutexLeave(sqlite3_mutex *p);
+static void pthreadMutexEnter(sqlite3_mutex *p);
 /*
 ** CAPI3REF: OS Interface Object
 **
@@ -18947,7 +18948,7 @@ SQLITE_API void sqlite3_mutex_free(sqlite3_mutex *p){
 */
 SQLITE_API void sqlite3_mutex_enter(sqlite3_mutex *p){
   if( p ){
-    sqlite3GlobalConfig.mutex.xMutexEnter(p);
+    pthreadMutexEnter(p);
   }
 }
 

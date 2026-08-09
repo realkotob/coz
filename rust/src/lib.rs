@@ -11,10 +11,10 @@
 //! [coz-readme]: https://github.com/plasma-umass/coz/blob/master/README.md
 //! [rust-readme]: https://github.com/alexcrichton/coz-rs/blob/master/README.md
 
-use once_cell::sync::OnceCell;
 use std::ffi::{CStr, CString};
 use std::mem;
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::{LazyLock, OnceLock};
 
 /// Equivalent of the `COZ_PROGRESS` and `COZ_PROGRESS_NAMED` macros
 ///
@@ -103,7 +103,7 @@ macro_rules! scope {
 /// `end!()`, but if necessary you can also create one of these manually in your
 /// own application for your own macros.
 pub struct Counter {
-    slot: OnceCell<Option<&'static coz_counter_t>>,
+    slot: OnceLock<Option<&'static coz_counter_t>>,
     ty: libc::c_int,
     name: &'static str,
 }
@@ -138,7 +138,7 @@ impl Counter {
 
     const fn new(ty: libc::c_int, name: &'static str) -> Counter {
         Counter {
-            slot: OnceCell::new(),
+            slot: OnceLock::new(),
             ty,
             name,
         }
@@ -158,7 +158,8 @@ impl Counter {
                 mem::size_of_val(&counter.count),
                 mem::size_of::<libc::size_t>()
             );
-            counter.count.fetch_add(1, SeqCst);
+            counter.count.fetch_add(1, Relaxed);
+            check_delays();
         }
     }
 
@@ -203,12 +204,16 @@ struct coz_counter_t {
 /// `typedef coz_counter_t* (*coz_get_counter_t)(int, const char*);`
 type GetCounterFn = unsafe extern "C" fn(libc::c_int, *const libc::c_char) -> *mut coz_counter_t;
 
-#[cfg(target_os = "linux")]
+/// The type of `_coz_add_delays` as defined in `include/coz.h`
+///
+/// `typedef void (*coz_add_delays_t)(void);`
+#[cfg(target_os = "macos")]
+type AddDelaysFn = unsafe extern "C" fn();
+
 fn coz_get_counter(ty: libc::c_int, name: &CStr) -> Option<*mut coz_counter_t> {
-    static GET_COUNTER: OnceCell<Option<GetCounterFn>> = OnceCell::new();
-    let func = GET_COUNTER.get_or_init(|| {
+    static GET_COUNTER: LazyLock<Option<GetCounterFn>> = LazyLock::new(|| {
         let name = CStr::from_bytes_with_nul(b"_coz_get_counter\0").unwrap();
-        // SAFETY: We are calling an external function that does exist in Linux.
+        // SAFETY: dlsym is available on all POSIX platforms (Linux, macOS, etc.).
         // No specific invariants that we must uphold have been defined.
         let func = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
         if func.is_null() {
@@ -220,13 +225,45 @@ fn coz_get_counter(ty: libc::c_int, name: &CStr) -> Option<*mut coz_counter_t> {
             Some(unsafe { mem::transmute(func) })
         }
     });
+    let func = &*GET_COUNTER;
 
     // SAFETY: We are calling an external function which exists as it is not None
     // No specific invariants that we must uphold have been defined.
     func.map(|f| unsafe { f(ty, name.as_ptr()) })
 }
 
-#[cfg(not(target_os = "linux"))]
-fn coz_get_counter(_ty: libc::c_int, _name: &CStr) -> Option<*mut coz_counter_t> {
-    None
+/// Check whether this thread owes the profiler any virtual delays.
+///
+/// This mirrors the `_COZ_CHECK_DELAYS` macro in `include/coz.h`. On macOS
+/// per-thread sampling timers are unavailable, so worker threads only discover
+/// their delay debt at progress points and must call `_coz_add_delays()` here.
+/// On Linux the SIGPROF handler already applies delays via `process_samples()`,
+/// so calling `_coz_add_delays()` again at every progress point would apply
+/// them twice and collapse throughput under high concurrency.
+#[cfg(target_os = "macos")]
+fn check_delays() {
+    coz_add_delays();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn check_delays() {}
+
+/// Calls `_coz_add_delays()` from libcoz.
+#[cfg(target_os = "macos")]
+fn coz_add_delays() {
+    static ADD_DELAYS: LazyLock<Option<AddDelaysFn>> = LazyLock::new(|| {
+        let name = CStr::from_bytes_with_nul(b"_coz_add_delays\0").unwrap();
+        let func = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        if func.is_null() {
+            None
+        } else {
+            Some(unsafe { mem::transmute(func) })
+        }
+    });
+    let func = &*ADD_DELAYS;
+
+    if let Some(f) = func {
+        // SAFETY: _coz_add_delays is a void->void function with no invariants.
+        unsafe { f() };
+    }
 }

@@ -2,6 +2,8 @@ set(sources
     ${PROJECT_SOURCE_DIR}/include/coz.h
     inspect.cpp
     inspect.h
+    lief_loader.cpp
+    lief_loader.h
     libcoz.cpp
     perf.cpp
     perf.h
@@ -19,6 +21,8 @@ if(APPLE)
     list(APPEND sources
         perf_macos.cpp
         perf_macos.h
+        mac_interpose.cpp
+        mac_interpose.h
     )
 endif()
 
@@ -37,11 +41,14 @@ target_include_directories(coz
     PUBLIC
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
+# Go's linker and GNU ld emit zlib-compressed DWARF; lief_loader inflates it.
+find_package(ZLIB REQUIRED)
+
 # Platform-specific libraries
 if(APPLE)
-    target_link_libraries(coz PRIVATE ${CMAKE_DL_LIBS} Threads::Threads libelfin::libelfin)
+    target_link_libraries(coz PRIVATE ZLIB::ZLIB ${CMAKE_DL_LIBS} Threads::Threads libelfin::libelfin LIEF::LIEF)
 else()
-    target_link_libraries(coz PRIVATE ${CMAKE_DL_LIBS} rt Threads::Threads libelfin::libelfin)
+    target_link_libraries(coz PRIVATE ZLIB::ZLIB ${CMAKE_DL_LIBS} rt Threads::Threads libelfin::libelfin LIEF::LIEF)
 endif()
 
 add_library(coz-instrumentation INTERFACE)

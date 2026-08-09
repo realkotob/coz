@@ -62,15 +62,27 @@ coz run --- ./toy/toy
    - `progress_point.h`: Throughput and latency point tracking
    - **Platform-specific sampling**:
      - `perf.cpp/h`: Linux implementation using perf_event_open syscall
-     - `perf_macos.cpp/h`: macOS implementation using kperf private framework
+     - `perf_macos.cpp/h`: macOS implementation using kperf private framework (Mach thread suspend + register read)
+   - **macOS-specific**:
+     - `mac_interpose.cpp/h`: `DYLD_INTERPOSE` wrappers for pthread/mutex/cond/rwlock/exit/signal functions. On macOS, `dlsym` returns the interposed version, so internal coz calls must go through `coz_orig_*` originals bound via `__asm("_name")`.
+     - `macho_support.cpp/h`: Mach-O binary inspection
+     - `lief_loader.cpp/h`: dSYM bundle lookup for debug info
    - `inspect.cpp/h`: DWARF debug info parsing using libelfin (supports DWARF 2-5). Source filtering obeys `COZ_SOURCE_SCOPE` (defaults to `%`) and the optional `COZ_FILTER_SYSTEM=1` env to drop `/usr/include`, `/usr/lib`, etc. Keep those flags in mind before hard-coding additional filters.
-   - `real.cpp/h`: Wrapper functions to capture real pthread/libc functions
+   - `path_filter.h`: Filters out Rust stdlib and dependency paths from profiling by default.
+   - `real.cpp/h`: Wrapper functions to capture real pthread/libc functions (Linux-only wrappers guarded by `#ifndef __APPLE__`; macOS uses `mac_interpose.cpp`).
    - `libcoz.cpp`: Library initialization and exported symbols
 
 2. **coz script** (`coz`): Python 3 command-line wrapper
-   - Handles `coz run` and `coz plot` commands
-   - Sets up LD_PRELOAD to inject libcoz.so
+   - Handles `coz run`, `coz plot`, and `coz suggest-points` subcommands
+   - Sets up LD_PRELOAD (Linux) / DYLD_INSERT_LIBRARIES (macOS) to inject libcoz.so
    - Manages profiler environment variables
+   - `coz plot` serves a local HTTP server with API endpoints:
+     - `/llm-config`: Returns env var availability for LLM providers
+     - `/anthropic-models`, `/openai-models`, `/bedrock-models`, `/ollama-models`: Dynamic model listing
+     - `/optimize`: Streaming AI optimization suggestions (POST, ndjson)
+     - `/source-snippet`: Source code context for viewer panels
+   - Bedrock endpoints use `converse_stream` API (model-agnostic) with inference profile fallback
+   - `coz suggest-points` runs an LLM tool-use agent (Anthropic / OpenAI / Bedrock / Ollama) that reads source via scoped `list_files`/`read_file`/`grep` tools and proposes `COZ_PROGRESS_NAMED` / `COZ_BEGIN` / `COZ_END` insertions. Each proposal includes rationale + unified diff; nothing is written without confirmation. Files already containing Coz macros are skipped, `#include "coz.h"` is auto-inserted, and originals are backed up to `*.coz.bak`. Entry points: `_coz_suggest_points` (~line 2192 of `coz`); subcommand parser at `_suggest_parser` (~line 2374). Flags include `--dry-run`, `--apply`, `--kind {throughput,latency,both}`, `--hint`, `--provider`, `--model`, `--include`, `--exclude`, `--max-points`.
 
 3. **include/coz.h**: Instrumentation macros for target programs
    - `COZ_PROGRESS` / `COZ_PROGRESS_NAMED`: Throughput progress points
@@ -79,10 +91,10 @@ coz run --- ./toy/toy
 
 4. **viewer** (`viewer/`): Web-based profile visualization UI
    - TypeScript/JavaScript single-page application for viewing `.coz` profile files
-   - `ts/profile.ts`: Profile parsing and D3.js plot rendering (loess smoothing, interactive tooltips)
-   - `ts/ui.ts`: UI logic including file loading, drag-and-drop, theme toggle, keyboard shortcuts
-   - `index.htm`: Main HTML with sidebar controls, welcome page, and help modals
-   - `css/ui.css`, `css/plot.css`: Modern dark/light theme styling
+   - `ts/profile.ts`: Profile parsing, D3.js plot rendering (loess smoothing, interactive tooltips), AI optimization panel, LLM provider management, dynamic model fetching with localStorage caching, cookie-based settings persistence
+   - `ts/ui.ts`: UI logic including file loading, drag-and-drop, theme toggle, keyboard shortcuts, resizable sidebar, model refresh handler
+   - `index.htm`: Main HTML with sidebar controls, welcome page, help modals, AI provider/model selectors with refresh button
+   - `css/ui.css`, `css/plot.css`: Modern dark/light theme styling, code block copy buttons, syntax highlighting
    - Uses Bootstrap 3, D3.js v3, jQuery, and science.js for statistics
 
 ### Causal Profiling Mechanism
@@ -198,10 +210,11 @@ g++ -g -o myapp myapp.cpp -ldl
 # Run with coz
 coz run --- ./myapp
 
-# View results (opens browser or use hosted viewer)
+# View results (automatically opens profile in browser)
 coz plot
-# Or visit: https://coz-profiler.github.io/coz-ui/
-# Or run the local viewer (see below)
+
+# Or load a specific profile
+coz plot -i /path/to/profile.coz
 ```
 
 If you only want to collect lines from your own sources (and not the C++ standard library), pass one or more `--source-scope` globs or set `COZ_SOURCE_SCOPE`. Coz also honors `COZ_FILTER_SYSTEM=1` as a quick toggle to drop system headers after the DWARF pass. For example:
@@ -213,6 +226,22 @@ coz run --source-scope '/media/psf/Home/git/coz-portage/benchmarks/**' --- ./ben
 # Or just drop system headers entirely
 COZ_FILTER_SYSTEM=1 coz run --- ./benchmarks/toy/toy
 ```
+
+**Verbose output:**
+
+Use `--verbose` (or `-v`) to see what libraries and source files coz is processing:
+
+```bash
+coz run --verbose --- ./myapp
+```
+
+This prints:
+- Bootstrap messages
+- MAIN executable path resolution
+- Source files found in DWARF debug info
+- Libraries being profiled
+
+Useful for debugging when coz isn't finding expected source lines or to verify which files are in scope.
 
 ### Adding Progress Points
 
@@ -235,6 +264,27 @@ void handle_transaction() {
 }
 ```
 
+### Suggesting Progress Points with an LLM
+
+When working in an unfamiliar codebase, use `coz suggest-points` to get AI-proposed placements:
+
+```bash
+# Default (Anthropic) — explore src/ and prompt per proposal
+export ANTHROPIC_API_KEY=...
+coz suggest-points src/
+
+# Show diffs only, no writes
+coz suggest-points --dry-run src/
+
+# Apply every accepted proposal without prompting
+coz suggest-points --apply src/
+
+# Only latency pairs (COZ_BEGIN/COZ_END), with a domain hint
+coz suggest-points --kind latency --hint "HTTP server" src/
+```
+
+Providers: `--provider {anthropic,openai,bedrock,ollama}`. Each uses the same tool-use loop; results vary by how well the chosen model follows tool-use instructions. Agent tools (`list_files`, `read_file`, `grep`) are scoped to the paths passed on the command line. Files already containing Coz macros are skipped. Accepted proposals insert the macro (matching surrounding indentation), add `#include "coz.h"` if missing, and back up the original to `*.coz.bak`. Latency points are only applied in matched `BEGIN`/`END` pairs.
+
 ### Rust Support
 
 Coz has Rust bindings in `rust/`:
@@ -255,73 +305,89 @@ target_link_libraries(myapp PRIVATE coz::coz)
 
 ### Profile Viewer
 
-The `viewer/` directory contains a local web-based UI for visualizing `.coz` profile files. This is an alternative to the hosted viewer at https://coz-profiler.github.io/coz-ui/.
+Run `coz plot` to view profiles. This launches a local web server and automatically opens your `profile.coz` in the browser. Use `coz plot -i /path/to/file.coz` to load a specific profile.
 
-**Building the viewer:**
+The viewer source is in `viewer/` (TypeScript/JavaScript single-page application).
 
-```bash
-cd viewer
-npm install    # Installs TypeScript and compiles ts/*.ts to js/*.js
-```
+**Text-mode output:**
 
-**Running the viewer:**
+For terminal-based analysis (useful for CI/CD pipelines, remote sessions, or code agents), use the `--text` flag:
 
 ```bash
-# Install a simple HTTP server (one-time)
-npm i -g http-server
+# Print a summary of profiling results to stdout
+coz plot --text
 
-# Serve the viewer
-cd viewer
-http-server
+# Print detailed results including all data points
+coz plot --text --verbose
 
-# Open http://localhost:8080/ in your browser
+# Analyze a specific profile file
+coz plot --text -i /path/to/profile.coz
 ```
+
+Text mode outputs:
+- Source file and line number for each profiled location
+- Linear regression slope (predicted speedup per % optimization)
+- Number of data points collected
+- With `--verbose`: individual speedup percentages and their measured effects
 
 **Viewer features:**
-- **Drag-and-drop**: Drop `.coz` files directly onto the page or use the file browser
-- **Sample profiles**: Built-in profiles from PARSEC benchmarks (blackscholes, dedup, ferret, fluidanimate, sqlite, swaptions)
-- **Interactive plots**: D3.js visualizations with loess-smoothed trend lines and tooltips showing exact speedup values
-- **Progress point legend**: Click progress point icons to toggle visibility
-- **Sort options**: Sort plots by impact (default), alphabetical, max speedup, or min speedup
-- **Minimum points filter**: Slider to filter out lines with insufficient data points
-- **Dark/light theme**: Toggle between themes (preference saved in localStorage)
-- **Keyboard shortcuts**: `Ctrl+O` to open file dialog, `?` to show help
+- Automatic profile loading from current directory
+- Drag-and-drop support for loading additional profiles
+- Interactive D3.js plots with loess-smoothed trend lines
+- Sort by impact, alphabetical, max/min speedup
+- Minimum points filter slider (auto-adjusts if needed)
+- Dark/light theme toggle (time-of-day default)
+- Keyboard shortcuts: `Ctrl+O` to open file, `?` for help
+- Resizable sidebar via drag handle (persisted in localStorage)
+- Source code snippets with syntax highlighting (click `</>` icon)
+- AI optimization suggestions (click magic wand icon)
+  - Streams responses with progress bar, copyable code blocks
+  - Supports Anthropic, OpenAI, Amazon Bedrock, and Ollama
+  - Dynamic model fetching with localStorage cache and manual refresh
+  - Bedrock uses inference profile IDs via `list_inference_profiles` API
+  - Settings (provider, keys, model selections, region) persisted in cookies
+  - AWS credentials sourced from server env vars (not persisted client-side)
 
-**Development:**
-
-TypeScript source files are in `ts/`. After modifying them, rebuild with:
+**Viewer development:**
 
 ```bash
-npx tsc -p tsconfig.json
+cd viewer
+npm install              # Install dependencies
+npx tsc -p tsconfig.json # Rebuild after editing ts/*.ts
 ```
 
-The compiled JavaScript files are output to `js/` and committed to the repo for convenience.
+The compiled JavaScript files are in `js/` and committed to the repo.
 
 ## System Requirements
 
 ### Linux
 - Linux 2.6.32+ with `perf_event_open` support
 - Set perf paranoia: `echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid`
-- Dependencies: libdwarf-dev, libelfin, pthread, dl, rt
+- Build dependencies: build-essential, cmake, pkg-config (libelfin fetched automatically)
 
 ### macOS
 - macOS 10.10+ (kperf framework availability)
 - Requires elevated privileges or SIP adjustments for kperf access
-- Dependencies: libelfin, pthread, dl
+- Build dependencies: cmake, pkg-config (libelfin fetched automatically)
+- Debug info lives in `.dSYM` bundles (not embedded); looked up via `lief_loader.cpp`
+- Library injection: `DYLD_INSERT_LIBRARIES` + `COZ_BINARY_SCOPE=MAIN` (the `coz` script sets this automatically)
+- Wall-clock `SIGPROF` timer (fires even on blocked threads) → `is_blocked` check in signal handler skips delays for blocked threads
+- `nanosleep` has ~1ms granularity; overshoot is tracked in `g_experiment_overshoot` and subtracted from experiment duration
 - **Important**: Uses private kperf API which may change without notice
-- Cannot be used in App Store applications due to private API usage
+- Cannot be distributed via Mac App Store due to private API usage
 
 ## Dependencies
 
-- **libelfin**: DWARF/ELF parsing (must be installed from https://github.com/plasma-umass/libelfin)
+- **libelfin**: DWARF/ELF parsing (fetched automatically during build via CMake FetchContent)
 - Build requires: CMake, C++11 compiler, Python 3, pkg-config
+- On Debian/Ubuntu: `sudo apt-get install build-essential cmake pkg-config`
 - Benchmark dependencies: libbz2-dev, libsqlite3-dev
 
 ## Output Format
 
 Profiler writes to `profile.coz` (configurable). Format includes:
 - Experiment records: speedup%, source location, progress delta, duration
-- Loaded at https://coz-profiler.github.io/coz-ui/ for visualization
+- View with `coz plot` command
 
 ### Interpreting Results
 
@@ -381,6 +447,13 @@ The authors demonstrated significant speedups on real applications:
 - JIT languages need debug info support (not currently implemented)
 - Programs must have meaningful progress points for accurate profiling
 
+## Releases
+
+GitHub releases include pre-built packages for Linux:
+- `.tar.gz` - Generic Linux tarball with install script
+- `.deb` - Debian/Ubuntu packages (amd64, arm64)
+- `.rpm` - Fedora/RHEL/CentOS packages (x86_64, aarch64)
+
 ## References
 
 **Original Paper**: Charlie Curtsinger and Emery D. Berger. 2015. "Coz: Finding Code that Counts with Causal Profiling." In Proceedings of the 25th Symposium on Operating Systems Principles (SOSP '15). ACM. DOI: 10.1145/2815400.2815409
@@ -388,4 +461,3 @@ The authors demonstrated significant speedups on real applications:
 - Paper: https://arxiv.org/abs/1608.03676
 - Received Best Paper Award at SOSP 2015
 - Project homepage: https://github.com/plasma-umass/coz
-- Web viewer: https://coz-profiler.github.io/coz-ui/
